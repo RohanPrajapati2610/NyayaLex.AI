@@ -1,0 +1,52 @@
+# LLM & Agent
+langchain==0.3.0
+langchain-community==0.3.0
+langchain-core==0.3.0
+langchain-groq==0.2.0
+groq==0.11.0
+langgraph==0.2.0
+
+# Embeddings & Vector Store
+chromadb==0.5.0
+sentence-transformers==3.2.0
+rank-bm25==0.2.2
+
+# Reranker
+FlagEmbedding==1.2.11
+
+# Evaluation
+ragas==0.2.0
+rouge-score==0.1.2
+bert-score==0.3.13
+
+# Experiment Tracking
+mlflow==2.18.0
+
+# API
+fastapi==0.115.0
+uvicorn==0.32.0
+pydantic==2.9.0
+python-multipart==0.0.12
+
+# Data Processing
+requests==2.32.0
+lxml==5.3.0
+beautifulsoup4==4.12.0
+python-dotenv==1.0.0
+tqdm==4.67.0
+jsonlines==4.0.0
+
+# NLP
+transformers==4.46.0
+torch==2.5.0
+
+# Case Outcome Predictor — nlpaueb/legal-bert-base-uncased loaded from HuggingFace Hub at runtime
+# Document Upload + Analysis
+pymupdf==1.24.0
+
+# Token counting for chunker
+tiktoken==0.8.0
+
+# HuggingFace Hub — for downloading pre-built ChromaDB on Spaces startup
+#                   and uploading ChromaDB to Dataset repo from local
+huggingface_hub==0.26.0
