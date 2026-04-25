@@ -30,6 +30,7 @@ models/
 # Secrets & config
 .env
 .env.*
+!.env.example
 *.key
 secrets/
 
