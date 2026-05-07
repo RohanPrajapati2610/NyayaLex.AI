@@ -1,50 +1,50 @@
-from typing import TypedDict, Annotated
+"""
+LangGraph state for the multi-hop legal research agent.
+
+Flows through every node: reason → retrieve → check → generate
+"""
+
 import operator
-
-
-class RetrievedChunk(TypedDict):
-    content: str
-    source: str
-    collection: str
-    score: float
-    metadata: dict
+from typing import Annotated, TypedDict
 
 
 class CitationResult(TypedDict):
-    source: str
-    excerpt: str
-    court: str | None
-    date: str | None
-    score: float
+    source:   str
+    excerpt:  str
+    court:    str | None
+    date:     str | None
+    citation: str | None
+    score:    float
     faithful: bool
 
 
 class OutcomePrediction(TypedDict):
-    verdict: str
+    verdict:    str
     confidence: float
-    label: str
+    label:      str
 
 
 class LegalResearchState(TypedDict):
-    # Input
-    question: str
-    jurisdiction: str                              # "us" | "india" | "both"
-    session_id: str
-    uploaded_doc_collection: str | None            # per-session ChromaDB collection if PDF uploaded
+    # ── Input ────────────────────────────────────────────────────────────────
+    question:                str
+    jurisdiction:            str           # "US" | "INDIA" | "BOTH"
+    session_id:              str
+    uploaded_doc_collection: str | None    # per-session ChromaDB collection if PDF uploaded
 
-    # Multi-hop tracking
-    hops: Annotated[list[dict], operator.add]      # accumulated retrieved chunks across hops
-    hop_count: int
-    max_hops: int                                  # default 4
-    reasoning_trace: Annotated[list[str], operator.add]  # LLM reasoning at each hop
-    next_query: str                                # refined query for next retrieval hop
-    sufficient: bool                               # CHECK node sets this to exit the loop
+    # ── Multi-hop tracking ───────────────────────────────────────────────────
+    hops:            Annotated[list[dict], operator.add]  # chunks accumulated across hops
+    hop_count:       int
+    max_hops:        int                   # default 4
+    reasoning_trace: Annotated[list[str], operator.add]
+    next_query:      str                   # refined query for next hop (set by REASON)
+    next_collections: list[str]            # collections to search next (set by REASON)
+    sufficient:      bool                  # CHECK node sets True to exit loop
 
-    # Memory
-    conversation_history: str                      # compressed by ConversationSummaryMemory
+    # ── Memory ───────────────────────────────────────────────────────────────
+    conversation_history: str              # compressed summary from ConversationSummaryMemory
 
-    # Output
-    final_answer: str
-    citations: list[CitationResult]
+    # ── Output ───────────────────────────────────────────────────────────────
+    final_answer:    str
+    citations:       list[CitationResult]
     conflict_warning: str | None
-    outcome: OutcomePrediction | None
+    outcome:         OutcomePrediction | None

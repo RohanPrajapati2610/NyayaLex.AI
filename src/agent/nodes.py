@@ -1,148 +1,216 @@
-from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, SystemMessage
-from src.agent.state import LegalResearchState
+"""
+LangGraph node implementations.
+
+Graph flow: reason → retrieve → check → generate
+
+  REASON   — LLM reads all chunks retrieved so far, decides next search query + collections
+  RETRIEVE — runs hybrid RAG (HyDE → dense + BM25 → RRF → reranker) on chosen collections
+  CHECK    — LLM decides if enough info to answer, or another hop is needed
+  GENERATE — LLM synthesises final answer with inline citations + conflict detection
+"""
+
 import json
-import os
+
+from src.agent.state import LegalResearchState
+from src.llm.groq_client import chat
+from src.llm.prompts import (
+    check_prompt,
+    conflict_detection_prompt,
+    generate_prompt,
+    reason_prompt,
+)
+from src.router.jurisdiction import collections_for_jurisdiction
 
 
-def get_llm() -> ChatGroq:
-    return ChatGroq(
-        model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-        api_key=os.getenv("GROQ_API_KEY"),
-        temperature=0,
-    )
-
+# ---------------------------------------------------------------------------
+# REASON node
+# ---------------------------------------------------------------------------
 
 def reason_node(state: LegalResearchState) -> dict:
     """
-    REASON node — LLM reads all retrieved chunks so far and decides
-    what to search next (or whether to stop).
+    Reads all retrieved chunks so far and decides:
+    - What to search next (next_query)
+    - Which collections to search (next_collections)
     """
-    llm = get_llm()
-
-    hops_summary = ""
-    for i, hop in enumerate(state["hops"]):
-        hops_summary += f"\nHop {i+1} retrieved from {hop.get('collection', 'unknown')}:\n{hop.get('content', '')[:300]}...\n"
-
-    system = (
-        "You are a legal research agent. Your job is to decide what to search next "
-        "to fully answer the user's legal question. Analyse what has already been retrieved "
-        "and identify gaps. Output a JSON with keys: "
-        "'next_query' (the refined search query), "
-        "'collection' (one of: us_statutes, us_case_law, us_regulations, india_statutes, india_constitution, india_case_law, uploaded_doc), "
-        "'reasoning' (why this search is needed)."
+    response = chat(
+        messages=reason_prompt(
+            question=state["question"],
+            hops_so_far=state["hops"],
+            conversation_summary=state.get("conversation_history", ""),
+        ),
+        temperature=0.0,
+        max_tokens=256,
     )
-    human = (
-        f"Question: {state['question']}\n\n"
-        f"Already retrieved ({len(state['hops'])} chunks):\n{hops_summary or 'Nothing yet.'}\n\n"
-        f"Conversation context:\n{state.get('conversation_history', 'None')}\n\n"
-        "What should I search next?"
-    )
-
-    response = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
 
     try:
-        parsed = json.loads(response.content)
-    except Exception:
-        parsed = {"next_query": state["question"], "collection": "us_statutes", "reasoning": "fallback"}
+        parsed      = json.loads(response)
+        next_query  = parsed.get("search_query", state["question"])
+        collections = parsed.get("collections", collections_for_jurisdiction(state["jurisdiction"]))
+        reasoning   = parsed.get("reasoning", "")
+    except (json.JSONDecodeError, ValueError):
+        # Fallback — search original question across all jurisdiction collections
+        next_query  = state["question"]
+        collections = collections_for_jurisdiction(state["jurisdiction"])
+        reasoning   = "fallback to default search"
+
+    # Include uploaded doc collection if present
+    if state.get("uploaded_doc_collection") and "uploaded_doc" not in collections:
+        collections = list(collections) + ["uploaded_doc"]
 
     return {
-        "next_query": parsed.get("next_query", state["question"]),
-        "reasoning_trace": [parsed.get("reasoning", "")],
+        "next_query":       next_query,
+        "next_collections": collections,
+        "reasoning_trace":  [reasoning],
     }
 
 
+# ---------------------------------------------------------------------------
+# RETRIEVE node
+# ---------------------------------------------------------------------------
+
 def retrieve_node(state: LegalResearchState, tools: dict) -> dict:
     """
-    RETRIEVE node — runs hybrid RAG on the collection chosen by REASON node.
+    Runs hybrid retrieval on the collections chosen by REASON.
+    Accumulates retrieved chunks into state["hops"].
     """
-    collection = state.get("next_query_collection", state["jurisdiction"])
-    tool_fn = tools.get(collection) or tools.get("us_statutes")
+    query       = state["next_query"]
+    collections = state.get("next_collections") or collections_for_jurisdiction(state["jurisdiction"])
+    history     = state.get("conversation_history", "")
 
-    chunks = tool_fn.invoke(state["next_query"])
+    # Use "all" tool if collections match the full jurisdiction set,
+    # otherwise call per-collection tools and merge
+    all_chunks: list[dict] = []
+    for col in collections:
+        tool_fn = tools.get(col) or tools.get("all")
+        if tool_fn:
+            chunks = tool_fn(query, history)
+            all_chunks.extend(chunks)
+
+    # Deduplicate by chunk id
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for chunk in all_chunks:
+        cid = chunk.get("id", "")
+        if cid not in seen:
+            seen.add(cid)
+            unique.append(chunk)
+
+    # Tag each chunk with which hop it came from
+    hop_record = {
+        "query":       query,
+        "collections": collections,
+        "chunks":      unique[:10],  # cap at 10 per hop to stay within context
+    }
 
     return {
-        "hops": chunks,
+        "hops":      [hop_record],   # Annotated[list, operator.add] — appends to existing
         "hop_count": state["hop_count"] + 1,
     }
 
 
+# ---------------------------------------------------------------------------
+# CHECK node
+# ---------------------------------------------------------------------------
+
 def check_node(state: LegalResearchState) -> dict:
     """
-    CHECK node — LLM decides if enough information has been retrieved
-    to generate a complete answer, or if another hop is needed.
+    Decides whether enough information has been retrieved to generate
+    a full answer, or whether another retrieval hop is needed.
     """
+    # Hard exit at max_hops
     if state["hop_count"] >= state["max_hops"]:
         return {"sufficient": True}
 
-    llm = get_llm()
-
-    all_content = "\n\n".join(
-        f"[{h.get('collection', '')}] {h.get('content', '')[:400]}"
-        for h in state["hops"]
+    response = chat(
+        messages=check_prompt(
+            question=state["question"],
+            hops_so_far=state["hops"],
+        ),
+        temperature=0.0,
+        max_tokens=64,
     )
-
-    system = (
-        "You are a legal research agent. Decide if the retrieved information is sufficient "
-        "to give a complete, accurate answer to the question. "
-        "Output JSON with key 'sufficient': true or false."
-    )
-    human = f"Question: {state['question']}\n\nRetrieved so far:\n{all_content}"
-
-    response = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
 
     try:
-        parsed = json.loads(response.content)
-        sufficient = parsed.get("sufficient", False)
-    except Exception:
-        sufficient = True
+        parsed     = json.loads(response)
+        sufficient = bool(parsed.get("enough", False))
+    except (json.JSONDecodeError, ValueError):
+        sufficient = True  # default to generating rather than looping infinitely
 
     return {"sufficient": sufficient}
 
 
+# ---------------------------------------------------------------------------
+# GENERATE node
+# ---------------------------------------------------------------------------
+
 def generate_node(state: LegalResearchState) -> dict:
     """
-    GENERATE node — synthesises all retrieved chunks into a final answer
-    with inline citations, using full conversation memory context.
+    Synthesises all retrieved chunks into a final answer with inline citations.
+    Also runs conflict detection across retrieved sources.
     """
-    llm = get_llm()
+    # Flatten all chunks from all hops
+    all_chunks: list[dict] = []
+    for hop in state["hops"]:
+        all_chunks.extend(hop.get("chunks", []))
 
-    context_blocks = []
-    for i, chunk in enumerate(state["hops"]):
-        context_blocks.append(
-            f"[SOURCE {i+1}] {chunk.get('source', 'Unknown')} "
-            f"({chunk.get('collection', '')}):\n{chunk.get('content', '')}"
+    # Deduplicate
+    seen: set[str] = set()
+    unique_chunks: list[dict] = []
+    for chunk in all_chunks:
+        cid = chunk.get("id", "")
+        if cid not in seen:
+            seen.add(cid)
+            unique_chunks.append(chunk)
+
+    top_chunks = unique_chunks[:5]  # final top-5 for answer generation
+
+    # --- Conflict detection ---
+    conflict_warning = None
+    if len(top_chunks) >= 2:
+        conflict_response = chat(
+            messages=conflict_detection_prompt(
+                question=state["question"],
+                chunks=top_chunks,
+            ),
+            temperature=0.0,
+            max_tokens=128,
         )
-    context = "\n\n".join(context_blocks)
+        try:
+            conflict_data = json.loads(conflict_response)
+            if conflict_data.get("conflict"):
+                conflict_warning = conflict_data.get("explanation", "Conflicting sources detected.")
+        except (json.JSONDecodeError, ValueError):
+            pass
 
-    system = (
-        "You are NyayaLex.AI, an expert legal assistant covering US federal law and Indian law. "
-        "Answer the question using ONLY the provided sources. "
-        "Cite sources inline as [SOURCE 1], [SOURCE 2], etc. "
-        "Be direct, precise, and legally accurate. "
-        "If sources conflict, acknowledge the conflict explicitly."
+    # --- Generate final answer ---
+    answer = chat(
+        messages=generate_prompt(
+            question=state["question"],
+            retrieved_chunks=top_chunks,
+            jurisdiction=state["jurisdiction"],
+            conversation_summary=state.get("conversation_history", ""),
+        ),
+        temperature=0.0,
+        max_tokens=1024,
+        stream=False,
     )
-    human = (
-        f"Conversation history:\n{state.get('conversation_history', 'None')}\n\n"
-        f"Question: {state['question']}\n\n"
-        f"Sources:\n{context}"
-    )
 
-    response = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
-
-    citations = [
-        {
-            "source": h.get("source", "Unknown"),
-            "excerpt": h.get("content", "")[:300],
-            "court": h.get("metadata", {}).get("court"),
-            "date": h.get("metadata", {}).get("date"),
-            "score": h.get("score", 0.0),
-            "faithful": True,
-        }
-        for h in state["hops"]
-    ]
+    # --- Build citation list ---
+    citations = []
+    for chunk in top_chunks:
+        meta = chunk.get("metadata", {})
+        citations.append({
+            "source":   meta.get("citation", meta.get("case_name", "Unknown")),
+            "excerpt":  chunk.get("text", "")[:300],
+            "court":    meta.get("court"),
+            "date":     meta.get("date_filed") or meta.get("date"),
+            "citation": meta.get("citation"),
+            "score":    chunk.get("reranker_score", chunk.get("rrf_score", 0.0)),
+            "faithful": True,  # NLI faithfulness check is applied in Phase 12 (pipeline)
+        })
 
     return {
-        "final_answer": response.content,
-        "citations": citations,
+        "final_answer":    answer,
+        "citations":       citations,
+        "conflict_warning": conflict_warning,
     }
